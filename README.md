@@ -1,7 +1,105 @@
-# Soul Runner Scheduler
+# Soul Runner — phase one
 
-Private repository for the Soul Runner PC 2K League scheduling app.
+This version does only **team registration, roster management, and recurring weekly availability**. The earlier matchup/recommendation UI is no longer served. Its source is retained in `legacy/` for reference, not imported by this application.
 
-Live site: https://soul-runner-pc-scheduler.romanwilliammorse.chatgpt.site
+## Owner flow
 
-The local Codex workspace is linked to this repository. Application source synchronization is pending local Git authentication; this initial README is not the application source.
+1. Enter the league password supplied by Roman.
+2. Press **Register team**.
+3. Enter the team name, Main/G League division, owner's name, and Discord username.
+4. Enter the other players' names and Discord usernames. The owner is automatically included as a player.
+5. Set a private owner password, a different shared team password, and a six-digit personal PIN.
+6. Select the owner's recurring weekly hours and save.
+7. Under **Share**, copy the team link and send it with the shared team password to players. Keep the link for owner return visits.
+
+There is no Discord OAuth and no Discord messaging in this phase. Discord usernames are contact fields. Team owners will finalize schedules in a later phase; game scheduling and exception dates are deliberately not included here.
+
+## Player flow
+
+1. Open the team's link and enter the team password.
+2. Select their name from the owner's roster.
+3. On the first visit, create and confirm a six-digit PIN. On subsequent sign-ins, enter that PIN.
+4. Select recurring availability, **Sunday through Saturday**, one hour per block, and choose **Save hours**.
+
+The editor supports multi-day ranges, weekday/weekend presets, and large per-day hourly buttons for phone and keyboard input. Touch scrolling does not paint hours. Availability persists on the server, including across devices. Each player chooses an IANA time zone; weekly wall-clock hours stay in that zone through daylight saving changes. The owner overview projects recurring patterns onto a selected week to account for daylight-saving changes. Ranked windows are proposals, not booked games.
+
+An unanswered player has `slots = NULL`. A player who submits no available hours has `slots = []` and a saved timestamp. These are intentionally different. Saving includes a version check so a stale browser cannot overwrite a newer response silently.
+
+## League setup
+
+The production site has a hosted D1 database provisioned by Sites. It no longer needs Supabase credentials. No sample teams or default league password are seeded in production.
+
+1. Visit `/?view=setup` while signed into the existing Site owner's ChatGPT account.
+2. Set the league password (at least 10 characters).
+3. Share the website and that password with owners once the host's access settings permit them to visit.
+
+The server-side `LEAGUE_ADMIN_EMAIL` setting identifies the existing Site administrator. It is configured in Sites runtime settings and checked against the trusted platform-injected authenticated email. Only that administrator can set or rotate the league password. Visiting a URL, knowing the league password, or registering a team never grants league administration. In a public deployment, administrator sign-in remains available at the setup URL; ordinary team owners and players use the application passwords/PINs.
+
+**Hosting access:** Public, as requested by the league owner. Owners and players enter using application passwords and player PINs; only league administration uses ChatGPT sign-in.
+
+## Passwords and recovery
+
+- League password: at least 10 characters, grants registration only.
+- Owner password: at least 10 characters, grants management of that owner's team and the owner's own availability.
+- Team password: at least 8 characters, grants access to roster selection only.
+- Personal PIN: exactly six digits, grants access to that player's availability. Knowing a player's PIN does not grant owner access, even when that player is the owner.
+- Passwords/PINs are salted PBKDF2-SHA256 hashes with 100,000 iterations. Session tokens are random 256-bit values, stored hashed on the server and in HttpOnly / SameSite=Strict / Secure-on-HTTPS cookies.
+- Incorrect password and PIN attempts are rate-limited on the server. PIN limits are scoped to a player, including across source IPs. All state-changing endpoints require same-origin JSON requests.
+- Owners can add/edit players, reset a non-owner player's PIN, remove players, and restore removed players. Removal is soft and preserves their saved hours; it revokes their active player sessions. PIN reset revokes player sessions but preserves availability.
+- Owners can change their team password, owner password, and own PIN under Share → Passwords & PIN. Team password changes revoke all player/team sessions for that team. Owner password changes revoke other owner sessions and replace the current owner's session.
+- A player claiming a previously unclaimed name must know the team password. The first claimant establishes that name's PIN; this is a roster-based trust model, not verified Discord identity. Owners can reset mistaken claims.
+- If an owner forgets their private password, there is no unauthenticated recovery endpoint. A league administrator must use trusted database maintenance to replace the hash and revoke that team's owner sessions. Do not hand out an owner's password to players.
+
+## Local development
+
+Node 22.13+ (Node 24 is used for tests), pnpm, and a working Cloudflare `workerd` runtime are required.
+
+```sh
+pnpm install
+pnpm db:generate  # only after changing db/schema.ts
+pnpm build
+```
+
+Apply each pending local migration once:
+
+```sh
+node --import ./scripts/sites-env.mjs ./node_modules/wrangler/bin/wrangler.js d1 execute DB --local --config dist/server/wrangler.json --persist-to .wrangler/state --file drizzle/0000_sour_franklin_storm.sql
+```
+
+Create ignored `.dev.vars` with `LEAGUE_ADMIN_EMAIL=seedy@sites.test` for the starter's loopback-only mock administrator. Run `pnpm dev`, open the printed localhost URL, and visit `/?view=setup`. “Administrator sign in” uses the starter's local mock identity. Production builds do not include that mock.
+
+On this Windows machine the bundled `workerd` required the bundled Visual C++ runtime DLL directory on PATH. The verified path is `C:\Users\Roman\.cache\codex-runtimes\codex-primary-runtime\dependencies\native\libheif\libheif\bin`. On another Windows installation, install the official Microsoft Visual C++ x64 runtime if `workerd --version` exits with missing-DLL status `0xC0000135`.
+
+```sh
+pnpm test   # API authorization, credential hashing, database persistence and integrity
+pnpm check  # TypeScript
+pnpm build  # deployable Worker and browser assets
+```
+
+`tests/local-smoke.mjs` is an **optional, loopback-only** fixture generator. With the local dev server running, it sets a test league password and creates an explicitly named local test team. It never contacts production. Do not use its published test passwords in a real league. Local D1 data is separate from hosted D1.
+
+## Architecture and deployment
+
+- Vinext / React / TypeScript with the supplied Sites build integration.
+- Server API: `lib/phase-api.ts`; route: `app/api/[...path]/route.ts`.
+- Credentials and validation: `lib/security.ts`.
+- Client: `app/scheduler.tsx`; minimal responsive styling: `app/globals.css`.
+- D1 schema: `db/schema.ts`. Generated schema-only migrations: `drizzle/`.
+- Hosting manifest declares the existing project and the `DB` binding. Sites applies migrations when publishing.
+- Runtime administrator configuration stays in Sites secrets; no password, PIN, or session token belongs in source or the hosting manifest.
+
+Existing phase-zero Supabase code and migrations are retained in `legacy/` but are not deployed as routes or run against D1. Existing production teams and saved hours are preserved on deployment.
+
+## Validation
+
+Automated tests exercise the actual API handler with SQLite using the generated D1 SQL schema and a transaction-capable D1 adapter. They cover admin-only setup, registration gating, owner-as-player behavior, hashed secrets, roster privacy, first-PIN claim, wrong PINs, team isolation, recurring hours/time zones, unanswered versus empty responses, stale saves, duplicate records, PIN reset, reversible removal, session revocation, CSRF protection, and rate limits.
+
+Browser QA uses a disposable local database at phone width. Hosted behavior should be checked with the real league password after the administrator sets it. No production league password was chosen on the administrator's behalf.
+
+## Owner availability overview
+
+Team Availability shows response progress and upcoming ranked windows. A proposal requires the same players for the complete 1–3 hour duration. The default requirement is five players; owners may change it explicitly. Proposals and missing-response reminders can be copied for manual sharing in Discord. Nothing is sent automatically and no game is booked. Matchups, confirmed bookings and date exceptions remain a later phase.
+
+## GitHub
+
+The private repository is https://github.com/romanwilliammorse/soul-runner-scheduler. The local origin remote points there. Source snapshots are synchronized through the connected GitHub integration. Sites publication remains separate. Direct command-line Git pushes require local Git authentication.

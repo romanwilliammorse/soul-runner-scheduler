@@ -1,0 +1,11 @@
+export type Season = { id: string; name: string; starts_at: string; ends_at: string; deadline: string; slot_minutes: number; duration_minutes: number };
+export type Division = { id: string; name: string; team_count: number; meetings: number };
+export type Team = { id: string; name: string; division_id: string; season_id: string };
+export type Member = { id: string; name: string; user_id: string | null; discord_id: string | null; is_admin: boolean };
+export type Roster = { id: string; team_id: string; member_id: string; owner: boolean; eligible: boolean; kind: string };
+export type Matchup = { id: string; team_a: string; team_b: string; meeting: number; status: string; starts_at: string | null; ends_at: string | null; deadline: string | null; note: string; override_reason: string | null };
+export type Slot = { member_id: string; starts_at: string; ends_at: string; available: boolean; updated_at?: string };
+export type Proposal = { id: string; matchup_id: string; starts_at: string; ends_at: string; status: string; accepted_a: boolean; accepted_b: boolean; created_at: string };
+export type Booking = { matchup_id: string; member_id: string; team_id: string; starts_at: string; ends_at: string };
+export type Option = { starts_at: string; ends_at: string; count_a: number; count_b: number };
+export type Snapshot = { seasons: Season[]; divisions: Division[]; teams: Team[]; members: Member[]; rosters: Roster[]; matchups: Matchup[]; proposals: Proposal[]; availability: Slot[]; bookings: Booking[]; me: string | null; notifications: { enabled: boolean; events: string[] }; audit: { id: string; action: string; created_at: string; detail: unknown }[]; outbox: { id: string; event: string; status: string; error: string | null }[] };

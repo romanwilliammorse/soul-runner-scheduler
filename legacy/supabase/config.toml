@@ -1,0 +1,4 @@
+project_id = "soul-runner-scheduler"
+
+[functions.discord-notifications]
+verify_jwt = false
