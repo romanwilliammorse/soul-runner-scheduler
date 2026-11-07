@@ -1,0 +1,8 @@
+// Local-only QA fixture. No production requests or real league records.
+const origin='http://127.0.0.1:5174';
+function client(initial=[]){const cookies=new Map(initial);return async(path,body)=>{const r=await fetch(origin+'/api/'+path,{method:body===undefined?'GET':'POST',headers:{Origin:origin,'Content-Type':'application/json',Cookie:[...cookies].map(([k,v])=>`${k}=${v}`).join(';')},body:body===undefined?undefined:JSON.stringify(body)});for(const c of r.headers.getSetCookie()){const [k,v]=c.split(';')[0].split('=');cookies.set(k,v);}const data=await r.json();if(!r.ok)throw Error(JSON.stringify(data));return data;};}
+const owner=client();await owner('league/login',{password:'local-league-test-only'});
+const team=await owner('register',{name:'Northside TEST '+String(Date.now()).slice(-4),division:'Main league',ownerName:'Roman Test',ownerDiscord:'roman.test',ownerPassword:'local-owner-test-only',teamPassword:'local-team-test-only',ownerPIN:'123456',players:['Alex','Jordan','Taylor','Sam'].map(name=>({name:name+' Test',discord:name.toLowerCase()+'.test'}))});
+const slots=[0,1,2,3,4,5,6].flatMap(d=>[18,19,20,21].map(h=>d*24+h));await owner(`team/${team.id}/availability`,{slots,timezone:'America/Los_Angeles',version:0});
+const state=await owner(`team/${team.id}`);for(const p of state.players.filter(p=>!p.is_owner)){const player=client();await player(`team/${team.id}/login`,{password:'local-team-test-only'});await player(`team/${team.id}/identify`,{memberId:p.id,pin:'123456',confirmPIN:'123456'});await player(`team/${team.id}/availability`,{slots,timezone:'America/Los_Angeles',version:0});}
+console.log(JSON.stringify({teamId:team.id,url:origin+'/?team='+team.id}));

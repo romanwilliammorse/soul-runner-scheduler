@@ -103,3 +103,11 @@ Team Availability shows response progress and upcoming ranked windows. A proposa
 ## GitHub
 
 The private repository is https://github.com/romanwilliammorse/soul-runner-scheduler. The local origin remote points there. Source snapshots are synchronized through the connected GitHub integration. Sites publication remains separate. Direct command-line Git pushes require local Git authentication.
+
+## November 4 interface rebuild
+
+The active entry point is now `app/league-app.tsx`. The new weekly grid adapts the MIT-licensed rectangle selector from `bibekg/react-schedule-selector`; see `vendor/schedule-selector/` for the pinned upstream revision and license. Heavy italic Barlow headings approximate the NBA 2K27 reference using self-hosted open-licensed fonts.
+
+Players edit an eight-hour portion of their week using Night / Day / Evening. Mouse dragging selects rectangular blocks; keyboard users move with arrows and toggle with Space/Enter. Touch users can tap or enable Drag; ordinary scrolling leaves cells unchanged. Bulk range entry is available below the grid. The owner view defaults to five players for a two-hour window, with secondary controls collapsed. Existing saved comparison preferences remain respected.
+
+Source comparisons, verification evidence, and limitations: `docs/rebuild-2026-11-04.md`. `tests/rebuild-fixture.mjs` creates a clearly labeled five-player fixture only on localhost port 5174.

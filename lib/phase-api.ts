@@ -27,7 +27,11 @@ export async function handleAPI(request:Request,env:Env){
   async function body(){if(Number(request.headers.get('content-length'))>30000)throw new APIError('Request is too large.',413);const raw=await request.text();if(raw.length>30000)throw new APIError('Request is too large.',413);try{return JSON.parse(raw) as Record<string,unknown>;}catch{throw new APIError('Invalid request.');}}
   if(request.method!=='GET'){
    if(request.method!=='POST')throw new APIError('Method not allowed.',405);
-   if(request.headers.get('Origin')!==url.origin)throw new APIError('Please submit from this website.',403);
+   const origin=request.headers.get('Origin');
+   // The branded Vercel address serves this same public Site through a rewrite.
+   // Keep an exact allowlist: forwarded-host headers must never grant CSRF access.
+   const brandedOrigin=origin==='https://soulrunnerhoops.vercel.app'&&url.origin==='https://soul-runner-pc-scheduler.romanwilliammorse.chatgpt.site';
+   if(origin!==url.origin&&!brandedOrigin)throw new APIError('Please submit from this website.',403);
    if(!request.headers.get('Content-Type')?.startsWith('application/json'))throw new APIError('JSON required.',415);
   }
   const setting=await db.prepare('SELECT password_hash FROM league_settings WHERE id=1').first<{password_hash:string}>();
@@ -67,7 +71,31 @@ export async function handleAPI(request:Request,env:Env){
    const rows=(await db.prepare('SELECT id,name,timezone,slots FROM team_players WHERE team_id=? AND active=1 ORDER BY is_owner DESC,name COLLATE NOCASE').bind(id).all<{id:string;name:string;timezone:string|null;slots:string|null}>()).results;
    return reply({players:rows.map(p=>({...p,slots:p.slots===null?null:JSON.parse(p.slots)}))});
   }
+  if((action==='games'||action==='messages')&&request.method==='GET'){
+   if(!self)throw new APIError('Identify yourself first.',401);
+   if(action==='games')return reply({games:(await db.prepare('SELECT id,opponent,starts_at FROM scheduled_games WHERE team_id=? AND starts_at>=? ORDER BY starts_at,id LIMIT 100').bind(id,new Date(Date.now()-6*3600000).toISOString()).all()).results});
+   const before=url.searchParams.get('before');if(before!==null&&!/^\d{1,15}$/.test(before))throw new APIError('Invalid message cursor.');
+   const rows=(await db.prepare('SELECT m.id,m.member_id,m.body,m.created_at,p.name FROM team_messages m JOIN team_players p ON p.id=m.member_id WHERE m.team_id=? AND m.id<? ORDER BY m.id DESC LIMIT 100').bind(id,before?Number(before):Number.MAX_SAFE_INTEGER).all()).results;
+   return reply({messages:rows.reverse(),hasMore:rows.length===100});
+  }
   if(request.method!=='POST')throw new APIError('Method not allowed.',405);const b=await body();
+  if(action==='messages'){
+   if(!self)throw new APIError('Identify yourself first.',401);
+   const message=text(b.message,'Message',2000),clientId=text(b.clientId,'Message identifier',64);
+   if(!/^[a-zA-Z0-9-]{8,64}$/.test(clientId))throw new APIError('Invalid message identifier.');
+   await rate(`chat:${id}:${self.id}`,60,900);
+   await db.prepare('INSERT INTO team_messages(team_id,member_id,client_id,body,created_at) VALUES(?,?,?,?,?) ON CONFLICT(team_id,member_id,client_id) DO NOTHING').bind(id,self.id,clientId,message,new Date().toISOString()).run();
+   return reply({ok:true});
+  }
+  if(action==='games'){
+   if(!isOwner||!self)throw new APIError('Owner password required.',403);
+   if(b.action==='remove'){await db.prepare('DELETE FROM scheduled_games WHERE id=? AND team_id=?').bind(text(b.gameId,'Game'),id).run();return reply({ok:true});}
+   if(b.action!=='add')throw new APIError('Unknown schedule action.');
+   const opponent=text(b.opponent,'Opponent team',60),start=text(b.startsAt,'Game time',40),date=new Date(start);
+   if(!/T.*Z$/.test(start)||!Number.isFinite(date.getTime())||date.getTime()<Date.now()||date.getTime()>Date.now()+366*86400000)throw new APIError('Choose a future game time within the next year.');
+   const gameId=text(b.gameId,'Game identifier',64);if(!/^[a-zA-Z0-9-]{8,64}$/.test(gameId))throw new APIError('Invalid game identifier.');
+   await db.prepare('INSERT INTO scheduled_games(id,team_id,opponent,starts_at,created_at) VALUES(?,?,?,?,?) ON CONFLICT(id) DO NOTHING').bind(gameId,id,opponent,date.toISOString(),new Date().toISOString()).run();return reply({ok:true});
+  }
   if(action==='login'||action==='owner-login'){
    const rateKey=`${action}:${id}:${request.headers.get('cf-connecting-ip')||'unknown'}`;await rate(rateKey);
    if(!await verifySecret(String(b.password||''),action==='login'?t.team_hash:t.owner_hash))throw new APIError('Incorrect password.',401);

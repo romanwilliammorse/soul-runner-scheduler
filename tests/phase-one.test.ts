@@ -12,14 +12,65 @@ class Statement{
  async all(){return {results:this.db.prepare(this.sql).all(...this.args)};}
  async run(){const r=this.db.prepare(this.sql).run(...this.args);return {meta:{changes:Number(r.changes)}};}
 }
-function fixture(){
+function fixture(origin='https://league.test',browserOrigin=origin){
  const sql=new DatabaseSync(':memory:');sql.exec('PRAGMA foreign_keys=ON');for(const f of readdirSync('drizzle').filter(f=>f.endsWith('.sql')))sql.exec(readFileSync(`drizzle/${f}`,'utf8'));
  const adapter={prepare:(s:string)=>new Statement(sql,s),batch:async(statements:Statement[])=>{sql.exec('BEGIN');try{const results=[];for(const s of statements)results.push(await s.run());sql.exec('COMMIT');return results;}catch(e){sql.exec('ROLLBACK');throw e;}}};
  const env={DB:adapter as unknown as D1Database,LEAGUE_ADMIN_EMAIL:'admin@example.test'};
- const client=(admin=false)=>{const cookies=new Map<string,string>();return {cookies,async req(path:string,body?:unknown,extra:Record<string,string>={}){const headers:Record<string,string>={cookie:[...cookies].map(([k,v])=>`${k}=${v}`).join(';'),'cf-connecting-ip':'127.0.0.1',...extra};if(body!==undefined){headers.Origin='https://league.test';headers['Content-Type']='application/json';}if(admin)headers['oai-authenticated-user-email']='admin@example.test';const response=await handleAPI(new Request(`https://league.test/api/${path}`,{method:body===undefined?'GET':'POST',headers,body:body===undefined?undefined:JSON.stringify(body)}),env);for(const cookie of response.headers.getSetCookie()){const [key,value]=cookie.split(';')[0].split('=');if(value)cookies.set(key,value);else cookies.delete(key);}return {status:response.status,body:await response.json() as any,headers:response.headers};}};};
+ const client=(admin=false)=>{const cookies=new Map<string,string>();return {cookies,async req(path:string,body?:unknown,extra:Record<string,string>={}){const headers:Record<string,string>={cookie:[...cookies].map(([k,v])=>`${k}=${v}`).join(';'),'cf-connecting-ip':'127.0.0.1',...extra};if(body!==undefined){headers.Origin=browserOrigin;headers['Content-Type']='application/json';}if(admin)headers['oai-authenticated-user-email']='admin@example.test';const response=await handleAPI(new Request(`${origin}/api/${path}`,{method:body===undefined?'GET':'POST',headers,body:body===undefined?undefined:JSON.stringify(body)}),env);for(const cookie of response.headers.getSetCookie()){const [key,value]=cookie.split(';')[0].split('=');if(value)cookies.set(key,value);else cookies.delete(key);}return {status:response.status,body:await response.json() as any,headers:response.headers};}};};
  return {sql,client,env};
 }
 const registration={name:'Test Team',division:'Main league',ownerName:'Owner',ownerDiscord:'owner.test',ownerPassword:'private-owner-password',teamPassword:'shared-team-password',ownerPIN:'123456',players:[{name:'Alex',discord:'alex.test'},{name:'Jordan',discord:'jordan.test'}]};
+test('branded origin supports login, host-only cookies, saved hours and reload without weakening CSRF',async()=>{
+ const upstream='https://soul-runner-pc-scheduler.romanwilliammorse.chatgpt.site',brand='https://soulrunnerhoops.vercel.app';
+ const f=fixture(upstream,brand),owner=f.client(true),p=f.client();
+ assert.equal((await owner.req('setup',{password:'league-password-test'})).status,200);
+ const created=await owner.req('register',registration);assert.equal(created.status,201);const id=created.body.id;
+ assert.equal((await p.req(`team/${id}/login`,{password:registration.teamPassword})).status,200);
+ const member=(await p.req(`team/${id}`)).body.players.find((p:any)=>p.name==='Alex');
+ const identified=await p.req(`team/${id}/identify`,{memberId:member.id,pin:'234567',confirmPIN:'234567'});assert.equal(identified.status,200);
+ for(const cookie of identified.headers.getSetCookie()){assert.ok(!cookie.toLowerCase().includes('domain='));assert.ok(cookie.includes('HttpOnly'));assert.ok(cookie.includes('SameSite=Strict'));assert.ok(cookie.includes('Secure'));}
+ assert.equal((await p.req(`team/${id}/availability`,{slots:[42,43],timezone:'America/Chicago',version:0})).status,200);
+ assert.deepEqual((await p.req(`team/${id}`)).body.self.slots,[42,43]);
+ assert.equal((await p.req(`team/${id}/roster`,{action:'add',name:'Forbidden',discord:'no'})).status,403);
+ for(const origin of ['https://evil.test','https://soulrunnerhoops.vercel.app.evil.test','http://soulrunnerhoops.vercel.app','null','']){
+  const headers={'Content-Type':'application/json',Origin:origin,'x-forwarded-host':'soulrunnerhoops.vercel.app'};
+  const response=await handleAPI(new Request(upstream+'/api/logout',{method:'POST',headers,body:'{}'}),f.env);assert.equal(response.status,403,origin);
+ }
+ assert.equal((await p.req('logout',{scope:'member'})).status,200);assert.equal((await p.req(`team/${id}`)).body.self,null);f.sql.close();
+});
+test('player hub: private chat, verified sender, retry deduplication, pagination and owner-managed schedule',async()=>{
+ const f=await registered(),p=f.client(),stranger=f.client();const root=`team/${f.id}`;
+ assert.equal((await stranger.req(`${root}/messages`)).status,401);
+ assert.equal((await stranger.req(`${root}/games`)).status,401);
+ await p.req(`${root}/login`,{password:registration.teamPassword});
+ assert.equal((await p.req(`${root}/messages`)).status,401);
+ const player=(await p.req(root)).body.players.find((x:any)=>x.name==='Alex');
+ await p.req(`${root}/identify`,{memberId:player.id,pin:'234567',confirmPIN:'234567'});
+ const msg={message:'Meet in the locker room <script>alert(1)</script>',clientId:'retry-message-123',memberId:'spoof',name:'spoof'};
+ assert.equal((await p.req(`${root}/messages`,msg)).status,200);
+ assert.equal((await p.req(`${root}/messages`,msg)).status,200);
+ const messages=(await f.owner.req(`${root}/messages`)).body.messages;
+ assert.equal(messages.length,1);assert.equal(messages[0].name,'Alex');assert.equal(messages[0].member_id,player.id);assert.equal(messages[0].body,msg.message);
+ assert.equal((await p.req(`${root}/messages`,{message:' ',clientId:'blank-message'})).status,400);
+ assert.equal((await p.req(`${root}/messages`,{message:'a'.repeat(2001),clientId:'long-message'})).status,400);
+ assert.equal((await p.req(`${root}/messages?before=invalid`)).status,400);
+ const game={action:'add',gameId:'game-retry-123',opponent:'Chicago Flight',startsAt:new Date(Date.now()+86400000).toISOString()};
+ assert.equal((await p.req(`${root}/games`,game)).status,403);
+ assert.equal((await f.owner.req(`${root}/games`,game)).status,200);
+ assert.equal((await f.owner.req(`${root}/games`,game)).status,200);
+ let games=(await p.req(`${root}/games`)).body.games;assert.equal(games.length,1);assert.equal(games[0].starts_at,game.startsAt);assert.equal(games[0].opponent,game.opponent);
+ assert.equal((await f.owner.req(`${root}/games`,{...game,startsAt:'bad'})).status,400);
+ assert.equal((await f.owner.req(`${root}/games`,{...game,startsAt:new Date(0).toISOString()})).status,400);
+ const other=f.client();await other.req('league/login',{password:'league-password-test'});const second=await other.req('register',{...registration,name:'Other team'});
+ assert.equal((await other.req(`${root}/messages`)).status,401);assert.equal((await other.req(`${root}/games`)).status,401);
+ await other.req(`team/${second.body.id}/games`,{action:'remove',gameId:game.gameId});assert.equal((await p.req(`${root}/games`)).body.games.length,1);
+ for(let i=0;i<105;i++)f.sql.prepare('INSERT INTO team_messages(team_id,member_id,client_id,body,created_at) VALUES(?,?,?,?,?)').run(f.id,player.id,`fixture-${i}`,`message ${i}`,new Date().toISOString());
+ const latest=(await p.req(`${root}/messages`)).body;assert.equal(latest.messages.length,100);assert.equal(latest.hasMore,true);
+ const earlier=(await p.req(`${root}/messages?before=${latest.messages[0].id}`)).body;assert.equal(earlier.messages.length,6);assert.equal(earlier.hasMore,false);assert.ok(earlier.messages.at(-1).id<latest.messages[0].id);
+ await f.owner.req(`${root}/games`,{action:'remove',gameId:game.gameId});assert.equal((await p.req(`${root}/games`)).body.games.length,0);
+ await f.owner.req(`${root}/roster`,{action:'remove',memberId:player.id});assert.equal((await p.req(`${root}/messages`)).status,401);assert.equal((await p.req(`${root}/messages`,msg)).status,401);
+ f.sql.close();
+});
 async function registered(){const f=fixture(),owner=f.client(true);assert.equal((await owner.req('setup',{password:'league-password-test'})).status,200);const r=await owner.req('register',registration);assert.equal(r.status,201);return {...f,owner,id:r.body.id as string};}
 test('correct logins do not exhaust the shared-network failure budget',async()=>{
  const f=await registered(),p=f.client();

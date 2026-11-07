@@ -1,0 +1,3 @@
+https://github.com/bibekg/react-schedule-selector
+Commit: 25eeec372fb8675a4ffcff7af14d8f95751fb16e
+Adaptation: modern date-fns imports; UI wrapper uses weekly slots and pointer/keyboard input.
