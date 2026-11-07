@@ -7,6 +7,8 @@ class APIError extends Error{constructor(message:string,public status=400){super
 function text(value:unknown,label:string,max=100){if(typeof value!=='string'||!value.trim()||value.trim().length>max)throw new APIError(`${label} is required (up to ${max} characters).`);return value.trim();}
 function password(value:unknown,label='Password',min=10){if(typeof value!=='string'||value.length<min||value.length>128)throw new APIError(`${label} must be ${min}–128 characters.`);return value;}
 function pin(value:unknown){if(typeof value!=='string'||!/^\d{6}$/.test(value))throw new APIError('Enter a six-digit PIN.');return value;}
+function discordKey(value:string){return value.trim().replace(/^@+/,'').trim().toLowerCase();}
+function discordUsername(value:unknown){return text(typeof value==='string'?discordKey(value):value,'Discord username',100);}
 const cookieNames={league:'sr_league',owner:'sr_owner',team:'sr_team',member:'sr_member'};
 const age={league:43200,owner:604800,team:86400,member:604800};
 type Kind=keyof typeof cookieNames;
@@ -67,7 +69,7 @@ export async function handleAPI(request:Request,env:Env){
    return reply({team:{id:t.id,name:t.name,division:t.division},owner:isOwner,access:hasTeam,players,self:self?{id:self.id,name:self.name,timezone:self.timezone,slots:self.slots===null?null:JSON.parse(self.slots),savedAt:self.saved_at,version:self.version}:null});
   }
   if(action==='availability'&&request.method==='GET'){
-   if(!isOwner)throw new APIError('Owner password required.',403);
+   if(!isOwner&&!self)throw new APIError('Identify yourself first.',403);
    const rows=(await db.prepare('SELECT id,name,timezone,slots FROM team_players WHERE team_id=? AND active=1 ORDER BY is_owner DESC,name COLLATE NOCASE').bind(id).all<{id:string;name:string;timezone:string|null;slots:string|null}>()).results;
    return reply({players:rows.map(p=>({...p,slots:p.slots===null?null:JSON.parse(p.slots)}))});
   }
@@ -102,6 +104,43 @@ export async function handleAPI(request:Request,env:Env){
    await db.prepare('DELETE FROM access_attempts WHERE key=?').bind(await digest(rateKey)).run();
    if(action==='login'){await clear('owner');await clear('member');await issue('team',id);}else{const owner=await db.prepare('SELECT id FROM team_players WHERE team_id=? AND is_owner=1 AND active=1').bind(id).first<{id:string}>();if(!owner)throw new APIError('Owner record missing.',409);await issue('owner',id,owner.id);}
    return reply({ok:true});
+  }
+  if(action==='join'){
+   if(!hasTeam)throw new APIError('Enter your team password first.',401);
+   await rate(`join:${id}:${request.headers.get('cf-connecting-ip')||'unknown'}`,40);
+   const name=text(b.name,'Player name',60),nameKey=name.toLocaleLowerCase(),discord=discordUsername(b.discord),value=pin(b.pin),joinId=text(b.joinId,'Join identifier',36).toLowerCase();
+   if(!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(joinId))throw new APIError('Reload the form and try joining again.');
+   if(value!==b.confirmPIN)throw new APIError('The PINs do not match.');
+   const duplicate='That name or Discord username is already on this team. Choose Returning player, or ask your owner for help.';
+   async function finishJoin(p:Player,retry:boolean){
+    // A request identifier is a retry key, never authorization to claim a player.
+    if(p.team_id!==id||!p.active||p.is_owner||p.name!==name||discordKey(p.discord)!==discord||!p.pin_hash)throw new APIError('This join request no longer matches. Choose Returning player, or ask your owner for help.',409);
+    if(retry){await rate(`pin:${id}:${p.id}`,8);if(!await verifySecret(value,p.pin_hash))throw new APIError('The PIN does not match this join request. Choose Returning player to sign in.',401);}
+    await clear('owner');
+    // Owner authorization also permits joining; retain team access after clearing it.
+    if(teamSession?.team_id!==id)await issue('team',id);
+    await issue('member',id,p.id);
+    if(retry)await db.prepare('DELETE FROM access_attempts WHERE key=?').bind(await digest(`pin:${id}:${p.id}`)).run();
+    return reply({ok:true,memberId:p.id},retry?200:201);
+   }
+   const previous=await db.prepare('SELECT * FROM team_players WHERE id=?').bind(joinId).first<Player>();
+   if(previous)return await finishJoin(previous,true);
+   // Check legacy records with JavaScript case folding too; SQLite LOWER handles ASCII.
+   const existing=(await db.prepare('SELECT name_key,discord FROM team_players WHERE team_id=?').bind(id).all<{name_key:string;discord:string}>()).results;
+   if(existing.some(p=>p.name_key===nameKey||discordKey(p.discord)===discord))throw new APIError(duplicate,409);
+   const hash=await hashSecret(value);
+   // Capacity, identity checks, and insertion run as one atomic statement. Removed
+   // identities also remain reserved; only the owner can restore those records.
+   const result=await db.prepare(`INSERT INTO team_players(id,team_id,name,name_key,discord,is_owner,active,pin_hash)
+    SELECT ?,?,?,?,?,0,1,?
+    WHERE (SELECT count(*) FROM team_players WHERE team_id=? AND active=1)<20
+    AND NOT EXISTS(SELECT 1 FROM team_players WHERE team_id=? AND (name_key=? OR lower(trim(ltrim(trim(discord),'@')))=?))
+    ON CONFLICT DO NOTHING`).bind(joinId,id,name,nameKey,discord,hash,id,id,nameKey,discord).run();
+   const created=await db.prepare('SELECT * FROM team_players WHERE id=?').bind(joinId).first<Player>();
+   if(created)return await finishJoin(created,result.meta.changes!==1);
+   const collision=await db.prepare("SELECT id FROM team_players WHERE team_id=? AND (name_key=? OR lower(trim(ltrim(trim(discord),'@')))=?)").bind(id,nameKey,discord).first();
+   if(collision)throw new APIError(duplicate,409);
+   throw new APIError('This team is full (20 players). Ask your owner to make room.',409);
   }
   if(action==='identify'){
    if(!hasTeam)throw new APIError('Enter your team password first.',401);const playerId=text(b.memberId,'Player');const value=pin(b.pin);await rate(`pin:${id}:${playerId}`,8);

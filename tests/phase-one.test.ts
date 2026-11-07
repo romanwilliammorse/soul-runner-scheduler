@@ -107,16 +107,90 @@ test('75 players across 15 teams retain isolated availability over 10 revisions'
  }
  assert.equal((f.sql.prepare('SELECT count(*) AS count FROM team_players').get() as any).count,75);f.sql.close();
 });
-test('team availability is owner-only and excludes removed players and secrets',async()=>{
+test('identified players see the same combined availability as owners, excluding removed players and secrets',async()=>{
  const f=await registered(),guest=f.client();
  assert.equal((await guest.req(`team/${f.id}/availability`)).status,403);
  await guest.req(`team/${f.id}/login`,{password:registration.teamPassword});
  assert.equal((await guest.req(`team/${f.id}/availability`)).status,403);
+ const roster=(await guest.req(`team/${f.id}`)).body.players,alex=roster.find((p:any)=>p.name==='Alex'),jordan=roster.find((p:any)=>p.name==='Jordan');
+ assert.equal((await guest.req(`team/${f.id}/identify`,{memberId:alex.id,pin:'678901',confirmPIN:'678901'})).status,200);
  await f.owner.req(`team/${f.id}/availability`,{slots:[],timezone:'UTC',version:0});
- let r=await f.owner.req(`team/${f.id}/availability`);assert.equal(r.status,200);assert.equal(r.body.players.length,3);assert.deepEqual(r.body.players[0].slots,[]);assert.equal(r.body.players[1].slots,null);
- assert.deepEqual(Object.keys(r.body.players[0]).sort(),['id','name','slots','timezone']);
- await f.owner.req(`team/${f.id}/roster`,{action:'remove',memberId:r.body.players[1].id});
- r=await f.owner.req(`team/${f.id}/availability`);assert.equal(r.body.players.length,2);f.sql.close();
+ assert.equal((await guest.req(`team/${f.id}/availability`,{slots:[42,43],timezone:'America/Chicago',version:0})).status,200);
+ let r=await f.owner.req(`team/${f.id}/availability`);assert.equal(r.status,200);assert.equal(r.body.players.length,3);assert.deepEqual(r.body.players[0].slots,[]);
+ assert.deepEqual(r.body.players.find((p:any)=>p.id===alex.id),{id:alex.id,name:'Alex',slots:[42,43],timezone:'America/Chicago'});
+ assert.equal(r.body.players.find((p:any)=>p.id===jordan.id).slots,null);
+ for(const player of r.body.players)assert.deepEqual(Object.keys(player).sort(),['id','name','slots','timezone']);
+ let playerResult=await guest.req(`team/${f.id}/availability`);assert.equal(playerResult.status,200);assert.deepEqual(playerResult.body,r.body);
+ await f.owner.req(`team/${f.id}/roster`,{action:'remove',memberId:jordan.id});
+ r=await f.owner.req(`team/${f.id}/availability`);assert.equal(r.body.players.length,2);assert.ok(r.body.players.every((p:any)=>p.id!==jordan.id));
+ playerResult=await guest.req(`team/${f.id}/availability`);assert.equal(playerResult.status,200);assert.deepEqual(playerResult.body,r.body);f.sql.close();
+});
+test('self-enrolled players can read team availability without receiving owner controls or editing another player',async()=>{
+ const f=await registered(),p=f.client(),root=`team/${f.id}`;
+ assert.equal((await p.req(`${root}/login`,{password:registration.teamPassword})).status,200);
+ assert.equal((await p.req(`${root}/join`,joinRequest())).status,201);
+ const owner=(await f.owner.req(root)).body.self,member=(await p.req(root)).body.self;
+ assert.equal((await f.owner.req(`${root}/availability`,{slots:[10],timezone:'UTC',version:0})).status,200);
+ assert.equal((await p.req(`${root}/availability`,{memberId:owner.id,slots:[42],timezone:'America/Chicago',version:0})).status,200);
+ const ownerResult=await f.owner.req(`${root}/availability`),playerResult=await p.req(`${root}/availability`);
+ assert.equal(playerResult.status,200);assert.deepEqual(playerResult.body,ownerResult.body);
+ assert.deepEqual(playerResult.body.players.find((row:any)=>row.id===owner.id).slots,[10]);
+ assert.deepEqual(playerResult.body.players.find((row:any)=>row.id===member.id).slots,[42]);
+ assert.equal((await p.req(root)).body.owner,false);
+ assert.equal((await p.req(`${root}/roster`,{action:'remove',memberId:owner.id})).status,403);
+ assert.equal((await p.req(`${root}/passwords`,{teamPassword:'unauthorized-password'})).status,403);
+ assert.equal((await p.req(`${root}/games`,{action:'add',gameId:'unauthorized-game',opponent:'Other team',startsAt:new Date(Date.now()+86400000).toISOString()})).status,403);
+ f.sql.close();
+});
+test('combined availability rejects cross-team, mismatched and expired member or team sessions',async()=>{
+ const f=await registered(),p=f.client(),otherOwner=f.client(),otherPlayer=f.client(),root=`team/${f.id}`;
+ await p.req(`${root}/login`,{password:registration.teamPassword});
+ const alex=(await p.req(root)).body.players.find((row:any)=>row.name==='Alex');
+ await p.req(`${root}/identify`,{memberId:alex.id,pin:'678901',confirmPIN:'678901'});
+ assert.equal((await p.req(`${root}/availability`)).status,200);
+ await otherOwner.req('league/login',{password:'league-password-test'});
+ const second=await otherOwner.req('register',{...registration,name:'Other team'});assert.equal(second.status,201);
+ const otherRoot=`team/${second.body.id}`;
+ await otherPlayer.req(`${otherRoot}/login`,{password:registration.teamPassword});
+ const otherAlex=(await otherPlayer.req(otherRoot)).body.players.find((row:any)=>row.name==='Alex');
+ await otherPlayer.req(`${otherRoot}/identify`,{memberId:otherAlex.id,pin:'345678',confirmPIN:'345678'});
+ assert.equal((await otherPlayer.req(`${otherRoot}/availability`)).status,200);
+ assert.equal((await p.req(`${otherRoot}/availability`)).status,403);
+ assert.equal((await otherPlayer.req(`${root}/availability`)).status,403);
+ assert.equal((await otherOwner.req(`${root}/availability`)).status,403);
+ const ownMemberCookie=p.cookies.get('sr_member')!;
+ p.cookies.set('sr_member',otherPlayer.cookies.get('sr_member')!);
+ assert.equal((await p.req(`${root}/availability`)).status,403);
+ assert.equal((await p.req(`${otherRoot}/availability`)).status,403);
+ p.cookies.set('sr_member',ownMemberCookie);
+ f.sql.prepare("UPDATE access_sessions SET expires=0 WHERE kind='member' AND member_id=?").run(alex.id);
+ assert.equal((await p.req(`${root}/availability`)).status,403);
+ assert.equal((await p.req(`${root}/identify`,{memberId:alex.id,pin:'678901'})).status,200);
+ assert.equal((await p.req(`${root}/availability`)).status,200);
+ f.sql.prepare("UPDATE access_sessions SET expires=0 WHERE kind='team' AND team_id=?").run(f.id);
+ assert.equal((await p.req(`${root}/availability`)).status,403);
+ assert.equal((await f.owner.req(`${root}/availability`)).status,200);
+ f.sql.close();
+});
+test('player combined-availability access is revoked by removal, inactivity, PIN reset or team-password rotation',async()=>{
+ for(const revocation of ['remove','inactive','reset-pin','password']){
+  const f=await registered(),p=f.client(),root=`team/${f.id}`;
+  await p.req(`${root}/login`,{password:registration.teamPassword});
+  const alex=(await p.req(root)).body.players.find((row:any)=>row.name==='Alex');
+  await p.req(`${root}/identify`,{memberId:alex.id,pin:'678901',confirmPIN:'678901'});
+  assert.equal((await p.req(`${root}/availability`)).status,200,revocation);
+  if(revocation==='inactive')f.sql.prepare('UPDATE team_players SET active=0 WHERE id=?').run(alex.id);
+  else if(revocation==='password')assert.equal((await f.owner.req(`${root}/passwords`,{teamPassword:'rotated-team-password'})).status,200);
+  else assert.equal((await f.owner.req(`${root}/roster`,{action:revocation,memberId:alex.id})).status,200);
+  assert.equal((await p.req(`${root}/availability`)).status,403,revocation);
+  assert.equal((await p.req(`${root}/availability`,{slots:[99],timezone:'UTC',version:0})).status,401,revocation);
+  if(revocation==='remove'){
+   assert.equal((await f.owner.req(`${root}/roster`,{action:'restore',memberId:alex.id})).status,200);
+   assert.equal((await p.req(`${root}/availability`)).status,403,'restoring a player must not restore revoked sessions');
+  }
+  assert.equal((await f.owner.req(`${root}/availability`)).status,200,revocation);
+  f.sql.close();
+ }
 });
 test('setup is admin-only; league password gates registration',async()=>{const f=fixture(),guest=f.client();assert.equal((await guest.req('setup',{password:'unauthorized-password'})).status,403);assert.equal((await guest.req('register',registration)).status,401);assert.equal((await guest.req('state')).body.configured,false);f.sql.close();});
 test('registration persists owner as a player and hashes every credential',async()=>{const f=await registered();const r=await f.owner.req(`team/${f.id}`);assert.equal(r.body.owner,true);assert.equal(r.body.players.length,3);assert.equal(r.body.self.name,'Owner');assert.equal(r.body.self.slots,null);assert.equal(r.body.players.find((p:any)=>p.is_owner).pin_set,1);const team=f.sql.prepare('select * from registered_teams').get() as any;assert.notEqual(team.owner_hash,registration.ownerPassword);assert.notEqual(team.team_hash,registration.teamPassword);assert.equal(JSON.stringify(r.body).includes('pbkdf2'),false);f.sql.close();});
@@ -134,4 +208,137 @@ test('credential hashes are salted; slot/time zone validation rejects invalid in
 test('first PIN claim is atomic when two clients select the same unclaimed player',async()=>{const f=await registered(),one=f.client(),two=f.client();await one.req(`team/${f.id}/login`,{password:registration.teamPassword});await two.req(`team/${f.id}/login`,{password:registration.teamPassword});const p=(await one.req(`team/${f.id}`)).body.players.find((p:any)=>p.name==='Alex');const result=await Promise.all([one.req(`team/${f.id}/identify`,{memberId:p.id,pin:'111111',confirmPIN:'111111'}),two.req(`team/${f.id}/identify`,{memberId:p.id,pin:'222222',confirmPIN:'222222'})]);assert.equal(result.filter(r=>r.status===200).length,1);assert.ok([401,409].includes(result.find(r=>r.status!==200)!.status));f.sql.close();});
 test('owner PIN grants personal availability but never roster-management rights',async()=>{const f=await registered(),p=f.client();await p.req(`team/${f.id}/login`,{password:registration.teamPassword});const owner=(await p.req(`team/${f.id}`)).body.players.find((x:any)=>x.is_owner);await p.req(`team/${f.id}/identify`,{memberId:owner.id,pin:registration.ownerPIN});assert.equal((await p.req(`team/${f.id}`)).body.owner,false);assert.equal((await p.req(`team/${f.id}/roster`,{action:'remove',memberId:owner.id})).status,403);assert.equal((await p.req(`team/${f.id}/availability`,{slots:[1],timezone:'UTC',version:0})).status,200);f.sql.close();});
 test('sessions are HttpOnly, secure over HTTPS, and expire',async()=>{const f=await registered(),p=f.client();const r=await p.req(`team/${f.id}/owner-login`,{password:registration.ownerPassword});assert.ok(r.headers.getSetCookie().some(c=>c.includes('HttpOnly')&&c.includes('Secure')&&c.includes('SameSite=Strict')));f.sql.exec('UPDATE access_sessions SET expires=0');assert.equal((await p.req(`team/${f.id}`)).body.access,false);f.sql.close();});
+
+const joinRequest=(overrides:Record<string,unknown>={})=>({name:'Casey Runner',discord:'casey.runner',pin:'456789',confirmPIN:'456789',joinId:crypto.randomUUID(),...overrides});
+
+test('self-join requires this team password session and rejects cross-origin requests',async()=>{
+ const f=await registered(),guest=f.client(),wrongTeam=f.client(),member=f.client(),root=`team/${f.id}`;
+ assert.equal((await guest.req(`${root}/join`,joinRequest())).status,401);
+ await wrongTeam.req('league/login',{password:'league-password-test'});
+ const second=await wrongTeam.req('register',{...registration,name:'Other Team'});
+ assert.equal(second.status,201);
+ assert.equal((await wrongTeam.req(`${root}/join`,joinRequest())).status,401);
+ await member.req(`${root}/login`,{password:registration.teamPassword});
+ const response=await handleAPI(new Request(`https://league.test/api/${root}/join`,{method:'POST',headers:{Origin:'https://evil.test','Content-Type':'application/json',cookie:[...member.cookies].map(([k,v])=>`${k}=${v}`).join(';')},body:JSON.stringify(joinRequest())}),f.env);
+ assert.equal(response.status,403);
+ assert.equal(f.sql.prepare('SELECT count(*) AS n FROM team_players WHERE team_id=?').get(f.id)!.n,3);
+ f.sql.close();
+});
+
+test('self-join saves player-entered identity and hashed PIN, then grants only member access',async()=>{
+ const f=await registered(),p=f.client(),root=`team/${f.id}`,data=joinRequest({name:'  Casey Runner  ',discord:' @Casey.Runner ',is_owner:1,active:0,team_id:'spoof'});
+ await p.req(`${root}/login`,{password:registration.teamPassword});
+ const joined=await p.req(`${root}/join`,data);assert.equal(joined.status,201);assert.equal(joined.body.memberId,data.joinId);
+ const row=f.sql.prepare('SELECT * FROM team_players WHERE id=?').get(data.joinId)!;
+ assert.equal(row.name,'Casey Runner');assert.equal(row.discord,'casey.runner');assert.equal(row.team_id,f.id);assert.equal(row.is_owner,0);assert.equal(row.active,1);
+ assert.notEqual(row.pin_hash,data.pin);assert.equal(await verifySecret(String(data.pin),String(row.pin_hash)),true);
+ const session=(await p.req(root)).body;assert.equal(session.owner,false);assert.equal(session.access,true);assert.equal(session.self.id,data.joinId);
+ assert.ok(!JSON.stringify(session).includes('pin_hash'));assert.ok(!JSON.stringify(session).includes('456789'));
+ for(const cookie of joined.headers.getSetCookie()){assert.ok(cookie.includes('HttpOnly'));assert.ok(cookie.includes('Secure'));assert.ok(cookie.includes('SameSite=Strict'));}
+ assert.equal((await p.req(`${root}/availability`,{slots:[42,43],timezone:'America/Chicago',version:0})).status,200);
+ assert.equal((await p.req(`${root}/messages`,{message:'I joined my team.',clientId:'self-join-message'})).status,200);
+ assert.equal((await p.req(`${root}/roster`,{action:'add',name:'Blocked',discord:'blocked'})).status,403);
+ assert.equal((await p.req(`${root}/passwords`,{teamPassword:'cannot-change-password'})).status,403);
+ assert.equal((await p.req(`${root}/games`,{action:'add'})).status,403);
+ assert.equal((await p.req(`${root}/availability`)).status,200);
+ const roster=(await f.owner.req(root)).body.players;assert.equal(roster.find((x:any)=>x.id===data.joinId).discord,'casey.runner');assert.equal(roster.find((x:any)=>x.id===data.joinId).responded,1);
+ await p.req('logout',{scope:'member'});assert.equal((await p.req(root)).body.self,null);
+ assert.equal((await p.req(`${root}/availability`)).status,403);
+ assert.equal((await p.req(`${root}/identify`,{memberId:data.joinId,pin:data.pin})).status,200);
+ assert.equal((await p.req(`${root}/availability`)).status,200);
+ assert.deepEqual((await p.req(root)).body.self.slots,[42,43]);
+ f.sql.close();
+});
+
+test('self-join validates player details, PIN confirmation and stable request identifier before insertion',async()=>{
+ const f=await registered(),p=f.client(),root=`team/${f.id}`;await p.req(`${root}/login`,{password:registration.teamPassword});
+ for(const invalid of [{name:''},{name:null},{name:'a'.repeat(61)},{discord:''},{discord:' @ '},{discord:'a'.repeat(101)},{pin:'12345'},{pin:'abcdef'},{confirmPIN:'654321'},{joinId:''},{joinId:'not-a-uuid'},{joinId:'00000000-0000-1000-8000-000000000000'}]){
+  const r=await p.req(`${root}/join`,joinRequest(invalid));assert.equal(r.status,400,JSON.stringify(invalid));
+ }
+ assert.equal(f.sql.prepare('SELECT count(*) AS n FROM team_players WHERE team_id=?').get(f.id)!.n,3);assert.equal((await p.req(root)).body.self,null);f.sql.close();
+});
+
+test('self-join rejects duplicate and removed identities without claiming existing roster records',async()=>{
+ const f=await registered(),p=f.client(),root=`team/${f.id}`;await p.req(`${root}/login`,{password:registration.teamPassword});
+ const alex=(await f.owner.req(root)).body.players.find((x:any)=>x.name==='Alex');
+ for(const input of [{name:' aLeX ',discord:'new.player'},{name:'New name',discord:' @ALEX.TEST '}]){
+  const r=await p.req(`${root}/join`,joinRequest(input));assert.equal(r.status,409);assert.match(r.body.error,/Returning player/);
+ }
+ assert.equal(f.sql.prepare('SELECT pin_hash FROM team_players WHERE id=?').get(alex.id)!.pin_hash,null);
+ await f.owner.req(`${root}/roster`,{action:'remove',memberId:alex.id});
+ for(const input of [{name:'Alex',discord:'another.name'},{name:'Another player',discord:'alex.test'}])assert.equal((await p.req(`${root}/join`,joinRequest(input))).status,409);
+ assert.equal(f.sql.prepare('SELECT active FROM team_players WHERE id=?').get(alex.id)!.active,0);
+ // Existing owner-entered handles may have capitalization or a leading @.
+ f.sql.prepare('UPDATE team_players SET discord=? WHERE name=? AND team_id=?').run(' @MiXeD.Handle ','Jordan',f.id);
+ assert.equal((await p.req(`${root}/join`,joinRequest({discord:'mixed.handle'}))).status,409);
+ f.sql.prepare('UPDATE team_players SET discord=? WHERE name=? AND team_id=?').run(' @ÉXAMPLE ','Jordan',f.id);
+ assert.equal((await p.req(`${root}/join`,joinRequest({discord:'éxample'}))).status,409);
+ assert.equal(f.sql.prepare('SELECT count(*) AS n FROM team_players WHERE team_id=?').get(f.id)!.n,3);f.sql.close();
+});
+
+test('self-join retries return the original member only when identity and PIN match',async()=>{
+ const f=await registered(),one=f.client(),two=f.client(),root=`team/${f.id}`,data=joinRequest();
+ await one.req(`${root}/login`,{password:registration.teamPassword});await two.req(`${root}/login`,{password:registration.teamPassword});
+ assert.equal((await one.req(`${root}/join`,data)).status,201);
+ const original=f.sql.prepare('SELECT * FROM team_players WHERE id=?').get(data.joinId)!;
+ const retry=await two.req(`${root}/join`,{...data,name:' Casey Runner ',discord:' @CASEY.RUNNER '});assert.equal(retry.status,200);assert.equal(retry.body.memberId,data.joinId);
+ assert.equal((await two.req(`${root}/join`,{...data,name:'Someone else'})).status,409);
+ assert.equal((await two.req(`${root}/join`,{...data,discord:'someone.else'})).status,409);
+ assert.equal((await two.req(`${root}/join`,{...data,pin:'987654',confirmPIN:'987654'})).status,401);
+ assert.equal((await two.req(`${root}/join`,{...data,joinId:crypto.randomUUID()})).status,409);
+ assert.deepEqual(f.sql.prepare('SELECT * FROM team_players WHERE id=?').get(data.joinId),original);
+ assert.equal(f.sql.prepare('SELECT count(*) AS n FROM team_players WHERE team_id=?').get(f.id)!.n,4);
+ await f.owner.req(`${root}/roster`,{action:'remove',memberId:data.joinId});assert.equal((await two.req(`${root}/join`,data)).status,409);
+ assert.equal((await two.req(root)).body.self,null);f.sql.close();
+});
+
+test('simultaneous joins deduplicate retries and names or Discord handles atomically',async()=>{
+ const f=await registered(),root=`team/${f.id}`;
+ const clients=[f.client(),f.client(),f.client(),f.client(),f.client(),f.client()];
+ for(const p of clients)await p.req(`${root}/login`,{password:registration.teamPassword});
+ const retry=joinRequest();const same=await Promise.all([clients[0].req(`${root}/join`,retry),clients[1].req(`${root}/join`,retry)]);
+ assert.deepEqual(same.map(r=>r.status).sort(),[200,201]);assert.equal(same[0].body.memberId,same[1].body.memberId);
+ const names=await Promise.all([clients[2].req(`${root}/join`,joinRequest({name:'Twin',discord:'twin.one'})),clients[3].req(`${root}/join`,joinRequest({name:'TWIN',discord:'twin.two'}))]);assert.deepEqual(names.map(r=>r.status).sort(),[201,409]);
+ const handles=await Promise.all([clients[4].req(`${root}/join`,joinRequest({name:'Handle one',discord:'Shared.Handle'})),clients[5].req(`${root}/join`,joinRequest({name:'Handle two',discord:'@SHARED.HANDLE'}))]);assert.deepEqual(handles.map(r=>r.status).sort(),[201,409]);
+ assert.equal(f.sql.prepare('SELECT count(*) AS n FROM team_players WHERE team_id=?').get(f.id)!.n,6);f.sql.close();
+});
+
+test('simultaneous self-joins cannot exceed the active 20-player roster limit',async()=>{
+ const f=await registered(),root=`team/${f.id}`,one=f.client(),two=f.client();
+ for(let i=0;i<16;i++)f.sql.prepare('INSERT INTO team_players(id,team_id,name,name_key,discord) VALUES(?,?,?,?,?)').run(crypto.randomUUID(),f.id,`Fixture ${i}`,`fixture ${i}`,`fixture.${i}`);
+ await one.req(`${root}/login`,{password:registration.teamPassword});await two.req(`${root}/login`,{password:registration.teamPassword});
+ const results=await Promise.all([one.req(`${root}/join`,joinRequest({name:'Last one',discord:'last.one'})),two.req(`${root}/join`,joinRequest({name:'Last two',discord:'last.two'}))]);
+ assert.deepEqual(results.map(r=>r.status).sort(),[201,409]);assert.match(results.find(r=>r.status===409)!.body.error,/full/);
+ assert.equal(f.sql.prepare('SELECT count(*) AS n FROM team_players WHERE team_id=? AND active=1').get(f.id)!.n,20);f.sql.close();
+});
+
+test('join retries share existing PIN rate limits and cannot claim owner or other-team identifiers',async()=>{
+ const f=await registered(),root=`team/${f.id}`,p=f.client(),data=joinRequest();await p.req(`${root}/login`,{password:registration.teamPassword});await p.req(`${root}/join`,data);
+ for(let i=0;i<8;i++)assert.equal((await p.req(`${root}/join`,{...data,pin:'999999',confirmPIN:'999999'})).status,401);
+ assert.equal((await p.req(`${root}/join`,{...data,pin:'999999',confirmPIN:'999999'})).status,429);
+ assert.equal((await p.req(`${root}/identify`,{memberId:data.joinId,pin:data.pin})).status,429);
+ const owner=(await f.owner.req(root)).body.players.find((x:any)=>x.is_owner);
+ assert.equal((await p.req(`${root}/join`,joinRequest({joinId:owner.id,name:owner.name,discord:owner.discord,pin:registration.ownerPIN,confirmPIN:registration.ownerPIN}))).status,409);
+ const other=f.client();await other.req('league/login',{password:'league-password-test'});const second=await other.req('register',{...registration,name:'Other Team'});
+ assert.equal((await other.req(`team/${second.body.id}/join`,data)).status,409);f.sql.close();
+});
+
+test('joining from an owner-authorized browser clears owner privileges while retaining team access',async()=>{
+ const f=await registered(),root=`team/${f.id}`,p=f.client(),data=joinRequest();
+ await p.req(`${root}/owner-login`,{password:registration.ownerPassword});assert.equal((await p.req(root)).body.owner,true);
+ assert.equal((await p.req(`${root}/join`,data)).status,201);
+ const team=(await p.req(root)).body;assert.equal(team.owner,false);assert.equal(team.access,true);assert.equal(team.self.id,data.joinId);
+ assert.equal(p.cookies.has('sr_owner'),false);assert.equal(p.cookies.has('sr_team'),true);
+ assert.equal((await p.req(`${root}/roster`,{action:'remove',memberId:data.joinId})).status,403);
+ assert.equal((await f.owner.req(root)).body.owner,true);f.sql.close();
+});
+
+test('repeated join submissions are limited per team and source IP',async()=>{
+ const f=await registered(),root=`team/${f.id}`,p=f.client(),data=joinRequest();await p.req(`${root}/login`,{password:registration.teamPassword});
+ assert.equal((await p.req(`${root}/join`,data)).status,201);
+ for(let i=0;i<39;i++)assert.equal((await p.req(`${root}/join`,{...data,joinId:crypto.randomUUID()})).status,409);
+ assert.equal((await p.req(`${root}/join`,{...data,joinId:crypto.randomUUID()})).status,429);
+ assert.equal((await p.req(`${root}/join`,{...data,joinId:crypto.randomUUID()},{'cf-connecting-ip':'127.0.0.2'})).status,409);
+ assert.equal(f.sql.prepare('SELECT count(*) AS n FROM team_players WHERE team_id=?').get(f.id)!.n,4);f.sql.close();
+});
 

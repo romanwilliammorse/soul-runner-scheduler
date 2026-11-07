@@ -1,25 +1,27 @@
-# Soul Runner — phase one
+# Soul Runner — team scheduler
 
-This version does only **team registration, roster management, and recurring weekly availability**. The earlier matchup/recommendation UI is no longer served. Its source is retained in `legacy/` for reference, not imported by this application.
+The app supports team registration, player self-enrollment, roster management, recurring weekly availability, owner-managed scheduled games, and private team chat. The original implementation is retained in `legacy/` for reference and is not imported by this application.
 
 ## Owner flow
 
 1. Enter the league password supplied by Roman.
 2. Press **Register team**.
 3. Enter the team name, Main/G League division, owner's name, and Discord username.
-4. Enter the other players' names and Discord usernames. The owner is automatically included as a player.
-5. Set a private owner password, a different shared team password, and a six-digit personal PIN.
-6. Select the owner's recurring weekly hours and save.
-7. Under **Share**, copy the team link and send it with the shared team password to players. Keep the link for owner return visits.
+4. Set a private owner password, a different shared team password, and a six-digit personal PIN. The owner is automatically included as a player.
+5. Registration opens **Invite & settings**. Copy the team link and share it with the team password. Players enter their own names and Discord usernames; the owner does not need to pre-enter a roster.
+6. Use **My hours** to save the owner's recurring availability, **Players** to manage the roster, and **Scheduled games** to record arranged matchups.
 
-There is no Discord OAuth and no Discord messaging in this phase. Discord usernames are contact fields. Team owners will finalize schedules in a later phase; game scheduling and exception dates are deliberately not included here.
+Discord usernames are contact fields, not verified Discord identities. The app does not use Discord OAuth or send Discord messages.
 
 ## Player flow
 
-1. Open the team's link and enter the team password.
-2. Select their name from the owner's roster.
-3. On the first visit, create and confirm a six-digit PIN. On subsequent sign-ins, enter that PIN.
-4. Select recurring availability, **Sunday through Saturday**, one hour per block, and choose **Save hours**.
+1. Open the team's link and enter the **team password** supplied by the owner.
+2. Under **Join team**, enter their own name and Discord username, then create and confirm a six-digit personal PIN.
+3. The app adds the player to the owner's roster and opens the player dashboard: scheduled games, Locker room, My availability, Metrics, and the combined team availability grid directly below Metrics.
+4. On later visits, use **Returning player**, choose their name, and enter the PIN. Existing owner-added players can still select their roster entry and create their first PIN.
+5. Under **My availability**, select recurring hours, **Sunday through Saturday**, one hour per block, and choose **Save hours**.
+
+Self-enrollment reserves names and normalized Discord usernames within a team, including removed identities. Duplicate or removed profiles are directed to returning-player sign-in or the owner. The 20-active-player limit includes the owner and is enforced atomically. A stable join request identifier makes retries safe without replacing a player's credentials or saved data.
 
 The editor supports multi-day ranges, weekday/weekend presets, and large per-day hourly buttons for phone and keyboard input. Touch scrolling does not paint hours. Availability persists on the server, including across devices. Each player chooses an IANA time zone; weekly wall-clock hours stay in that zone through daylight saving changes. The owner overview projects recurring patterns onto a selected week to account for daylight-saving changes. Ranked windows are proposals, not booked games.
 
@@ -41,12 +43,12 @@ The server-side `LEAGUE_ADMIN_EMAIL` setting identifies the existing Site admini
 
 - League password: at least 10 characters, grants registration only.
 - Owner password: at least 10 characters, grants management of that owner's team and the owner's own availability.
-- Team password: at least 8 characters, grants access to roster selection only.
+- Team password: at least 8 characters, grants access to self-enrollment and returning-player selection. A personal PIN is still required for each player profile.
 - Personal PIN: exactly six digits, grants access to that player's availability. Knowing a player's PIN does not grant owner access, even when that player is the owner.
 - Passwords/PINs are salted PBKDF2-SHA256 hashes with 100,000 iterations. Session tokens are random 256-bit values, stored hashed on the server and in HttpOnly / SameSite=Strict / Secure-on-HTTPS cookies.
 - Incorrect password and PIN attempts are rate-limited on the server. PIN limits are scoped to a player, including across source IPs. All state-changing endpoints require same-origin JSON requests.
 - Owners can add/edit players, reset a non-owner player's PIN, remove players, and restore removed players. Removal is soft and preserves their saved hours; it revokes their active player sessions. PIN reset revokes player sessions but preserves availability.
-- Owners can change their team password, owner password, and own PIN under Share → Passwords & PIN. Team password changes revoke all player/team sessions for that team. Owner password changes revoke other owner sessions and replace the current owner's session.
+- Owners can change their team password, owner password, and own PIN under Invite & settings → Passwords & PIN. Team password changes revoke all player/team sessions for that team. Owner password changes revoke other owner sessions and replace the current owner's session.
 - A player claiming a previously unclaimed name must know the team password. The first claimant establishes that name's PIN; this is a roster-based trust model, not verified Discord identity. Owners can reset mistaken claims.
 - If an owner forgets their private password, there is no unauthenticated recovery endpoint. A league administrator must use trusted database maintenance to replace the hash and revoke that team's owner sessions. Do not hand out an owner's password to players.
 
@@ -99,6 +101,8 @@ Browser QA uses a disposable local database at phone width. Hosted behavior shou
 ## Owner availability overview
 
 Team Availability shows response progress and upcoming ranked windows. A proposal requires the same players for the complete 1–3 hour duration. The default requirement is five players; owners may change it explicitly. Proposals and missing-response reminders can be copied for manual sharing in Discord. Nothing is sent automatically and no game is booked. Matchups, confirmed bookings and date exceptions remain a later phase.
+
+Every identified active player also sees the same combined grid on their home page, expanded by default. Owner and player views share the grid markup, colors, overlap calculations, week/time-zone controls, and player-name breakdown. Players can inspect team hours but still edit only their own. The team password alone does not grant access to the combined grid. Testing mode uses sample teammates and the test player's saved hours without requesting real team data.
 
 ## GitHub
 
